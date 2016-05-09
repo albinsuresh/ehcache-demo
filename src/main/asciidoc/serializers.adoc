@@ -1,0 +1,269 @@
+ifndef::sourcedir[]
+:sourcedir: ../..
+endif::sourcedir[]
+
+= Custom Serializers
+
+The Ehcache 3 documentation at http://www.ehcache.org/documentation/3.0/serializers-copiers.html#serializers[Serializers]
+gives you an overview of how to use custom serializers with a cache.
+The section on http://www.ehcache.org/documentation/3.0/serializers-copiers.html#persistent-vs-transient-caches[Persistent and Transient Serializers]
+briefly covers the serializer contracts that must be honored while writing custom serializers to be used with 
+persistent/transient caches.
+
+This article explains how you can write a transient/persistent custom serializer that works with Ehcache.
+Here we discuss the significance of transient serializers and persistent serializers in detail through some
+practical examples.
+
+== Serializer types
+
+As indicated in the Ehcache documentation, serializers require a single argument constructor or a double-argument 
+constructor or both based on the type of cache they are used in.
+The single-argument constructor is fit to be used with transient caches and the ones with the double-argument constructor can be used with persistent caches.
+An implementation having both the constructors can be used with both _persistent_ and _transient_ caches.
+
+Hmm... So what does that really mean?
+
+If you look at the custom serializer implementations in the GettingStarted samples they are all have both the constructors
+and if you look at the code they don't do anything different.
+It's all standard java serialization.
+
+- So what difference do the constructors make?
+- What is a _transient_ serializer with single-argument constructor?
+- How do I implement a _persistent_ serializer with the double-argument constructor?
+- When would I use both?
+
+Read along for the answers to these questions.
+
+These constructors are associated with the state of the serializer implementations.
+So if your custom serializer doesn't have any state associated with it; that affects the serialization and
+deserialization logic; then that is a serializer implementation that can safely be used with transient and persistent
+caches. Such serializers would have both the constructors.
+If you look at the `LongSerializer` or `StringSerializer` implementations in the GettingStarted samples, they don't have
+any state that the serialization and deserialization depend on.
+
+So what are these serializers with *state*? I'll try to explain that with some examples in the subsequent sections.
+
+=== Stateful serializers
+
+I have an application that deals with fruits. So I have a _fruits_ cache `Cache<Long, String>` that holds the mappings
+from fruit ids to fruit names.
+If this cache is a multi-tiered one then the keys and values will be stored in their serialized form in the 
+non-heap tiers.
+For simplicity I'll restrict the scope of our discussion only to the values that are fruit names of type `String`.
+I can use standard Java serialization to serialize these values.
+But for some reason I wanted to reduce the amount of serialized data.
+So instead of serializing the strings directly I decided to map all the fruit names to some integer and store those 
+serialized integers instead of strings thinking that it'd save some space(dumb, huh?).
+Since this serializer is designed specifically for the fruits cache, I was fairly confident that the integer range would
+be more than enough to handle all possible fruit names on this planet.
+And here is the serializer implementation that I came up with:
+
+[source,java,indent=0]
+----
+include::{sourcedir}/test/java/org/ehcache/demo/serializer/SimpleTransientStringSerializer.java[tag=transientSerializer]
+----
+
+In short this is what the above serializer does: Whenever it gets a string(the fruit name, in our application) to be
+serialized it checks if there is a mapping that exists already for that name in `stringIdMap`.
+If yes, the mapped integer is retrieved from the map and that integer value is serialized.
+If a mapping is not found, we generate a new `id` for the new fruit name add it to both the maps that we preserve
+(`stringIdMap` and `idStringMap`) and then serialize this newly generated id.
+Now on deserialization, the same `idStringMap` map is used to retrieve the fruit names from the deserialised integer
+values.
+
+So in the above serializer, the `idStringMap`, `stringIdMap` and the `id` constitutes the _state_ of the serializer.
+The serialization and deserialization depends on this state and would not work properly without that state.
+This serializer has the single-argument constructor making it fit to be used with transient caches.
+So now that we have a state-full serializer understanding the idea of _transient_ and _persistent_ serializers would be
+simpler.
+
+Here is a sample code that uses the `SimpleTransientStringSerializer` with a cache:
+
+[source,java,indent=0]
+----
+include::{sourcedir}/test/java/org/ehcache/demo/serializer/SerializersDemo.java[tag=transientSerializerGoodSample]
+----
+
+<1> Create a multi-tiered cache that requires key and value serialization.
+<2> Configure a serializer for the values. The `SimpleTransientStringSerializer` in this case. For the sake of simplicity
+    we have omitted key serializer. Since one is not provided explicitly, ehcache would provide default serializers to
+    perform the key serialization.
+<3> Verify that the cache/serializer works.
+
+In the previous section we demonstrated the use of a transient serializer.
+We used that serializer with a transient cache and everything works just fine.
+Now imagine what would happen if we use the same serializer with a persistent cache.
+Everything would work as long as your application is running. Once you close the cache manager or end the application 
+the data associated with the cache will be persisted so that the same data will be available on a restart.
+But there is a serious problem. The following piece of code would demonstrate that:
+
+[source,java,indent=0]
+----
+include::{sourcedir}/test/java/org/ehcache/demo/serializer/SerializersDemo.java[tag=transientSerializerBadSample]
+----
+
+<1> Create a cache configuration with persistent disk tier.
+<2> Configure the `LocalPersistenceService` for the cache manager.
+<3> Retrieve the cache.
+<4> Populate data.
+<5> Verify that everything works.
+<6> Close the cache manager.
+<7> Reinitialize the cache manager.
+<8> Retrieve the cache.
+<9> Retrieve a cached/persisted value.
+
+The above piece of code would fail in the cache creation step since the serializer provided does not meet the 2-arg 
+constructor requirement for persistent caches.
+But why does `Ehcache` enforce this requirement and fail-fast if the requirement is violated?
+What would have happened if we had proceeded with the sample code?
+Would it have failed? If yes, then where?
+
+The above piece of code would have failed in step 9 because the cache would not be able to retrieve the persisted data.
+Because the serializer that you provided would fail in retrieving that data.
+When the cache is reinitialized, the associated serializer instance is also initialized for the cache to work.
+But the newly initialized serializer would have an empty state(empty `stringIdMap` and `idStringMap` maps and the `id`
+initialized to 0).
+So when the cache tries to read a value it gets an integer value from the persistent tier as that is what got persisted.
+But using the empty state the serializer will not able to map that value to a fruit name, and so it would throw.
+That leaves the persisted data unusable.
+So what could you have done differently to make it work?
+
+The answer is simple.
+Persist the serializer's state as well and restore it when the cache is re-initialized.
+And that is exactly what persistent serializers would do.
+
+=== Persistent serializers
+
+* A persistent serializer persists its state and retrieves it when reinitialized.
+* A persistent serializer implementation can choose to persist the data wherever it wants.
+
+But a recommended way is to use the cache manager's `LocalPersistenceService` so that the cache manager would take care
+of the persistence.
+Inorder to do that, the serializer implementation needs to have a constructor that takes in a
+`FileBasedPersistenceContext` as an argument, in addition to the class loader argument.
+The use of the `FileBasedPersistenceContext` argument is optional.
+But the presence of this double-argument constructor is a strict requirement for persistent caches.
+When the cache using this serializer is initialized, this 2-argument constructor is used to instantiate the serializer.
+
+Have a look at this implementation of a persistent serializer.
+It is just an extension of the same old transient serializer with the persistent stuff wired in.
+
+[source,java,indent=0]
+----
+include::{sourcedir}/test/java/org/ehcache/demo/serializer/SimplePersistentStringSerializer.java[tag=persistentSerializer]
+----
+
+In the above persistent serializer, the state or the serialization/deserialization has not changed.
+The only additional thing is the persistence logic. And that is fairly simple too.
+The state is restored on initialization if one is found, and persisted on close.
+And have a look at the sample from the previous section modified to use our persistent serializer.
+
+[source,java,indent=0]
+----
+include::{sourcedir}/test/java/org/ehcache/demo/serializer/SerializersDemo.java[tag=persistentSerializerGoodSample]
+----
+
+<1> The only change from the previous sample is the usage of `SimplePersistentStringSerializer` here.
+
+== Third-party serializers
+
+Ehcache by-default relies on a tweaked form of java standard serialization to perform serialization and deserialization.
+But most of you already know that java built-in serialization is not the best performing serialization technique.
+A lot of alternative serialization techniques are available in the market.
+With the custom serializers support of ehcache you can take advantage of any one of those third-party serializers out 
+there and use those within ehcache.
+All you have to do is write a custom serializer using the third-party serializer of your choice.
+
+In-order to demonstrate that, I have written a custom serializer using the popular serialization framework *Kryo*.
+Samples used in this section are not the same fruits cache based ones.
+Here I'm using an employee cache of type `Cache<Long, Employee>`.
+I have kept the `Employee` object as simple as possible and yet represent a real-life object structure.
+These are the structures that we have used:
+
+[source,java,indent=0]
+----
+include::{sourcedir}/test/java/org/ehcache/demo/model/Description.java[tag=descriptionClass]
+----
+
+[source,java,indent=0]
+----
+include::{sourcedir}/test/java/org/ehcache/demo/model/Person.java[tag=personClass]
+----
+
+[source,java,indent=0]
+----
+include::{sourcedir}/test/java/org/ehcache/demo/model/Employee.java[tag=employeeClass]
+----
+
+NOTE: None of the above classes are `Serializable`. Yet they can be serialized with Kryo. But for that every class needs
+a no-arg constructor and these classes meet that requirement.
+
+So here is the kryo based custom serializer:
+
+[source,java,indent=0]
+----
+include::{sourcedir}/test/java/org/ehcache/demo/serializer/KryoSerializer.java[tag=thirdPartySerializer]
+----
+
+The above serializer is a state-less one that demonstrates the basic integration with kryo.
+Here is the sample code that uses the same:
+
+[source,java,indent=0]
+----
+include::{sourcedir}/test/java/org/ehcache/demo/serializer/SerializersDemo.java[tag=thirdPartySerializer]
+----
+
+<1> Here we configure the `KryoSerializer` for the *VALUE*.
+
+Using some advanced features of kryo I managed to write the _transient_ only and _persistent_ only versions too.
+
+Here is the transient one:
+
+[source,java,indent=0]
+----
+include::{sourcedir}/test/java/org/ehcache/demo/serializer/TransientKryoSerializer.java[tag=thirdPartyTransientSerializer]
+----
+
+<1> This *objectHeaderMap* is the state of the serializer. When an object is serialized the fully qualified name of the
+    class is written in the header. Since writing the entire name is costly I decided to map these names to some integer
+    values and then write out that integer instead of the name. So this map would contain the mapping between the
+    classes and the corresponding integer values.
+<2> Here we register a class with kryo and then kryo will assign an integer value to that class so that all instances of
+    class will be serialized with this assigned integer in-place of the fully-qualified class name. The `Employee` class
+    in this case. Refer https://github.com/EsotericSoftware/kryo#registration[Kryo#Registartion] for more information.
+<3> Since `Employee` extends `Person` we register that too.
+<4> Since the `Person` class contain a `Description` instance we register that too. So the idea is to register all
+    known custom class types associated with the object to be serialized(the employee object).
+<5> This is how we populate the *objectHeaderMap* every time we register a class.
+
+The following sample is the same as the one in the previous section with just the serializer changed:
+
+[source,java,indent=0]
+----
+include::{sourcedir}/test/java/org/ehcache/demo/serializer/SerializersDemo.java[tag=transientKryoSerializer]
+----
+
+The above sample must be self explanatory as we have already seen this sample so many times.
+
+And now the persistent adaptation of the transient serializer is here:
+
+[source,java,indent=0]
+----
+include::{sourcedir}/test/java/org/ehcache/demo/serializer/PersistentKryoSerializer.java[tag=thirdPartyPersistentSerializer]
+----
+
+You must be familiar with this routine already:
+
+<1> On initialization, if a persistent file is found...
+<2> Restore the contents of the file which essentially restores the *objectHeaderMap*
+<3> Then iterate through the contents of the map and...
+<4> Register the types again with *kryo* using the same integer mapped values. Then only the persisted data can be 
+    deserialized as they are persisted with these integer values in their headers.  
+<5> On _close_, the map is serialized and persisted to a file.
+
+And the familiar test sample again testing this persistent serializer implementation: 
+
+[source,java,indent=0]
+----
+include::{sourcedir}/test/java/org/ehcache/demo/serializer/SerializersDemo.java[tag=persistentKryoSerializer]
+----
